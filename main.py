@@ -1,10 +1,23 @@
+from collections import defaultdict
+from datetime import datetime, timedelta
 import telebot
 from telebot import types
 import sqlite3
-from datetime import datetime
+from requests.adapters import HTTPAdapter
+from requests.sessions import Session
+from telebot import apihelper
+
+session = Session()
+retries = HTTPAdapter(max_retries=3)
+session.mount('http://', retries)
+session.mount('https://', retries)
+apihelper._get_req_session = lambda: session
 
 TOKEN = '6718983088:AAFWAC9AIGIjvzVRFL5Sy_52jtueG-DkbvE'
 bot = telebot.TeleBot(TOKEN)
+
+user_commands = defaultdict(list)
+
 
 def init_db():
     conn = sqlite3.connect('finance_bot.db')
@@ -27,58 +40,99 @@ def init_db():
         )
     ''')
     cursor.execute('''
-            CREATE TABLE IF NOT EXISTS limits (
-                user_id INTEGER,
-                category TEXT,
-                limit_amount REAL,
-                period TEXT,
-                FOREIGN KEY (user_id) REFERENCES users (id)
-            )
-        ''')
+        CREATE TABLE IF NOT EXISTS limits (
+            user_id INTEGER,
+            category TEXT,
+            limit_amount REAL,
+            period TEXT,
+            FOREIGN KEY (user_id) REFERENCES users (id)
+        )
+    ''')
     conn.commit()
     conn.close()
+
+def check_command_limits(user_id, command):
+    now = datetime.now()
+    time_threshold = now - timedelta(seconds=20)
+    recent_commands = [cmd for cmd in user_commands[user_id] if cmd[0] > time_threshold]
+    user_commands[user_id] = recent_commands
+    user_commands[user_id].append((now, command))
+    command_count = len([cmd for cmd in user_commands[user_id] if cmd[1] == command])
+    return command_count > 10
+
+@bot.message_handler(func=lambda message: True)
+def handle_message(message):
+    user_id = message.from_user.id
+    command = message.text
+    if check_command_limits(user_id, command):
+        with open("img.png", "rb") as photo:
+            bot.send_photo(message.chat.id, photo, caption="Пожалуйста, остановитесь!")
+    else:
+        bot.send_message(message.chat.id, "Команда принята: " + command)
+
 
 @bot.message_handler(commands=['start'])
 def send_welcome(message):
     markup = types.ReplyKeyboardMarkup(row_width=2, resize_keyboard=True)
-    btn1 = types.KeyboardButton('Расход')
-    btn2 = types.KeyboardButton('Пополнение')
-    btn3 = types.KeyboardButton('Баланс')
-    btn4 = types.KeyboardButton('Транзакции')
-    btn5 = types.KeyboardButton('Лимиты')
-    markup.add(btn1, btn2, btn3, btn4, btn5)
-    welcome_text = """Добро пожаловать в вашего финансового помощника! Используйте кнопки ниже для управления вашими финансами.
-    Введите 'отмена' в любой момент, чтобы прервать текущее действие."""
+    transactions_btn = types.KeyboardButton('Транзакции')
+    limits_btn = types.KeyboardButton('Лимиты')
+    goals_btn = types.KeyboardButton('Цели')
+    currency_rates_btn = types.KeyboardButton('Курсы валют')
+    markup.add(transactions_btn, limits_btn, goals_btn, currency_rates_btn)
+    welcome_text = "Добро пожаловать в вашего финансового помощника! Используйте кнопки ниже для управления вашими финансами."
     bot.send_message(message.chat.id, welcome_text, reply_markup=markup)
 
+@bot.message_handler(func=lambda message: message.text == 'Транзакции')
+def transaction_menu(message):
+    markup = types.ReplyKeyboardMarkup(row_width=2, resize_keyboard=True)
+    expense_btn = types.KeyboardButton('Расход')
+    income_btn = types.KeyboardButton('Пополнение')
+    list_transactions_btn = types.KeyboardButton('Список транзакций')
+    clear_transactions_btn = types.KeyboardButton('Очистить транзакции')
+    back_btn = types.KeyboardButton('Назад')
+    markup.add(expense_btn, income_btn, list_transactions_btn, clear_transactions_btn, back_btn)
+    bot.send_message(message.chat.id, "Какое действие вы хотите совершить?", reply_markup=markup)
 
-def ask_for_transaction_details(message):
-    if message.text.lower() == 'отмена':
-        bot.send_message(message.chat.id, "Действие отменено.")
-        return
-    sent = bot.send_message(message.chat.id, "Введите транзакцию в формате: сумма категория")
-    bot.register_next_step_handler(sent, process_transaction, message.text)
 
-def set_limit(message):
-    if message.text.lower() == 'отмена':
-        bot.send_message(message.chat.id, "Действие отменено.")
-        return
+@bot.message_handler(func=lambda message: message.text == 'Очистить транзакции')
+def clear_transactions(message):
+    conn = sqlite3.connect('finance_bot.db')
+    cursor = conn.cursor()
+    cursor.execute('DELETE FROM transactions WHERE user_id=?', (message.from_user.id,))
+    conn.commit()
+    conn.close()
+    bot.reply_to(message, "Все ваши транзакции удалены.")
+
+@bot.message_handler(func=lambda message: message.text in ['Расход', 'Пополнение'])
+def handle_transaction(message):
+    transaction_type = message.text
+    ask_for_transaction_details(message, transaction_type)
+
+def ask_for_transaction_details(message, transaction_type):
+    markup = get_cancel_back_markup()
+    sent = bot.send_message(message.chat.id, "Введите транзакцию в формате: сумма категория", reply_markup=markup)
+    bot.register_next_step_handler(sent, process_transaction, transaction_type)
+
+@bot.message_handler(func=lambda message: message.text == 'Отмена')
+def cancel_action(message):
+    bot.send_message(message.chat.id, "Действие отменено.", reply_markup=types.ReplyKeyboardRemove())
+    send_welcome(message)
+
+@bot.message_handler(func=lambda message: message.text == 'Назад')
+def go_back(message):
+    send_welcome(message)
+
+
+def process_transaction(message, transaction_type):
     try:
-        parts = message.text.split()
-        category = parts[0]
-        amount = float(parts[1])
-        period = parts[2]
-        conn = sqlite3.connect('finance_bot.db')
-        cursor = conn.cursor()
-        cursor.execute('INSERT INTO limits (user_id, category, limit_amount, period) VALUES (?, ?, ?, ?)',
-                       (message.from_user.id, category, amount, period))
-        conn.commit()
-        conn.close()
-        bot.reply_to(message, f"Установлен лимит {amount} рублей на {period} для категории {category}.")
-    except Exception as e:
-        bot.reply_to(message, "Ошибка ввода. Пожалуйста, убедитесь, что формат верен: Категория Сумма Период")
-
-
+        amount, category = message.text.split(maxsplit=1)
+        amount = float(amount)
+        if transaction_type == 'Расход':
+            amount = -amount
+        log_transaction(message.from_user.id, amount, transaction_type.lower(), category)
+        bot.reply_to(message, f"Транзакция зарегистрирована: {transaction_type} {amount} руб. Категория: {category}")
+    except ValueError:
+        bot.reply_to(message, "Ошибка ввода. Пожалуйста, введите данные в формате: сумма категория")
 
 def log_transaction(user_id, amount, transaction_type, category):
     conn = sqlite3.connect('finance_bot.db')
@@ -91,33 +145,7 @@ def log_transaction(user_id, amount, transaction_type, category):
     conn.commit()
     conn.close()
 
-
-def process_transaction(message, transaction_type):
-    try:
-        amount, category = message.text.split(maxsplit=1)
-        amount = float(amount)
-        if transaction_type == 'Расход':
-            amount = -amount
-        log_transaction(message.from_user.id, amount, transaction_type.lower(), category)
-        check_limits(message.from_user.id, category, abs(amount))
-        bot.reply_to(message, f"Транзакция зарегистрирована: {transaction_type} {amount} руб. Категория: {category}")
-    except ValueError:
-        bot.reply_to(message, "Ошибка ввода. Пожалуйста, введите данные в формате: сумма категория")
-
-
-@bot.message_handler(func=lambda message: message.text == 'Баланс')
-def show_balance(message):
-    conn = sqlite3.connect('finance_bot.db')
-    cursor = conn.cursor()
-    cursor.execute('SELECT SUM(amount) FROM transactions WHERE user_id=?', (message.from_user.id,))
-    result = cursor.fetchone()[0]
-    balance = result if result is not None else 0
-    if balance == 0:
-        bot.reply_to(message, "У вас не было транзакций.")
-    else:
-        bot.reply_to(message, f"Ваш баланс: {balance} руб.")
-
-@bot.message_handler(func=lambda message: message.text == 'Транзакции')
+@bot.message_handler(func=lambda message: message.text == 'Список транзакций')
 def show_transactions(message):
     conn = sqlite3.connect('finance_bot.db')
     cursor = conn.cursor()
@@ -129,31 +157,12 @@ def show_transactions(message):
         transactions_list = '\n'.join([f"{index+1}) {t[0]}: {t[1]} руб, Категория: {t[2]}, Дата: {t[3]}" for index, t in enumerate(transactions)])
         bot.reply_to(message, f"Ваши транзакции:\n{transactions_list}")
 
-@bot.message_handler(func=lambda message: message.text == 'Лимиты')
-def limits_menu(message):
-    sent = bot.send_message(message.chat.id, "Введите лимит в формате: Категория Сумма Период (неделя/месяц)")
-    bot.register_next_step_handler(sent, set_limit)
-
-
-def check_limits(user_id, category, amount):
-    conn = sqlite3.connect('finance_bot.db')
-    cursor = conn.cursor()
-    cursor.execute('SELECT limit_amount FROM limits WHERE user_id=? AND category=?', (user_id, category))
-    limit = cursor.fetchone()
-    if limit:
-        limit_amount = limit[0]
-        cursor.execute('''
-            SELECT SUM(amount) FROM transactions 
-            WHERE user_id=? AND category=? AND type='expense' AND date >= DATE('now', 'start of month')
-        ''', (user_id, category))
-        spent = cursor.fetchone()[0] or 0
-        if spent + amount >= limit_amount * 0.95:
-            remaining = limit_amount - spent - amount
-            bot.send_message(user_id,
-                             f"Внимание: Вы близки к лимиту по категории {category}. Осталось {remaining} руб.")
-    conn.close()
-
-
+def get_cancel_back_markup():
+    markup = types.ReplyKeyboardMarkup(row_width=2, resize_keyboard=True)
+    cancel_btn = types.KeyboardButton('Отмена')
+    back_btn = types.KeyboardButton('Назад')
+    markup.add(cancel_btn, back_btn)
+    return markup
 
 
 init_db()
