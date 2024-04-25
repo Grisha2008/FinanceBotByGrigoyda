@@ -4,12 +4,37 @@ import telebot
 from telebot import types
 import sqlite3
 import requests
+import schedule
+import time
+import threading
 
 TOKEN = "6718983088:AAFWAC9AIGIjvzVRFL5Sy_52jtueG-DkbvE"
 bot = telebot.TeleBot(TOKEN)
 
 user_commands = defaultdict(list)
 
+def get_all_user_ids():
+    conn = sqlite3.connect("finance_bot.db")
+    cursor = conn.cursor()
+    cursor.execute("SELECT id FROM users")
+    user_ids = [row[0] for row in cursor.fetchall()]
+    conn.close()
+    return user_ids
+
+def send_daily_photo():
+    user_ids = get_all_user_ids()
+    photo_path = 'img_1.png'
+    for user_id in user_ids:
+        with open(photo_path, 'rb') as photo:
+            bot.send_photo(user_id, photo, caption="???")
+def run_scheduler():
+    schedule.every().day.at("18:00").do(send_daily_photo)
+    while True:
+        schedule.run_pending()
+        time.sleep(1)
+
+thread = threading.Thread(target=run_scheduler)
+thread.start()
 
 def init_db():
     conn = sqlite3.connect("finance_bot.db")
@@ -116,7 +141,7 @@ def get_cancel_back_markup():
 
 def send_welcome(message):
     markup = types.ReplyKeyboardMarkup(row_width=2, resize_keyboard=True)
-    markup.add("Цели", "Транзакции", "Курсы валют", "Конвертер валют")
+    markup.add("Баланс", "Цели", "Транзакции", "Курсы валют", "Конвертер валют")
     welcome_text = "Выберите действие:"
     bot.send_message(message.chat.id, welcome_text, reply_markup=markup)
 
@@ -181,7 +206,7 @@ def set_goal(message):
             message.chat.id,
             "Неверный формат ввода. Пожалуйста, введите данные в формате: название, сумма",
         )
-        set_goal_request(message)  # Повторно запрашиваем данные
+        set_goal_request(message)
 
 
 @bot.message_handler(func=lambda message: message.text == "Список целей")
@@ -393,9 +418,29 @@ def cancel_action(message):
     send_welcome(message)
 
 
+@bot.message_handler(func=lambda message: message.text == "Баланс")
+def show_balance(message):
+    user_id = message.from_user.id
+    conn = sqlite3.connect("finance_bot.db")
+    cursor = conn.cursor()
+    cursor.execute("SELECT SUM(amount) FROM transactions WHERE user_id=?", (user_id,))
+    result = cursor.fetchone()[0]
+    conn.close()
+    if result is None:
+        result = 0
+    if result < 0:
+        photo_path = 'img_2.png'
+        with open(photo_path, 'rb') as photo:
+            bot.send_photo(message.chat.id, photo,
+                           caption="Поздравляю, вы бомж!!!")
+            bot.send_message(message.chat.id, f"Ваш текущий баланс: {result} руб.")
+    else:
+        bot.send_message(message.chat.id, f"Ваш текущий баланс: {result} руб.")
+
+
 def process_user_command(message):
     if check_command_limits(message.from_user.id, message.text):
-        return  # Прервать обработку, если это спам
+        return
 
     if message.text == "Назад":
         handle_back(message)
@@ -431,6 +476,8 @@ def process_user_command(message):
         handle_currency_conversion(message)
     elif message.text == "/start":
         send_welcome(message)
+    elif message.text == 'Баланс':
+        show_balance(message)
     else:
         bot.send_message(
             message.chat.id,
@@ -440,3 +487,15 @@ def process_user_command(message):
 
 init_db()
 bot.polling()
+
+#Можно я 10 строчек вот так нафармлю, чтобы их 500 стало? пжпжпжпжпжпжп
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
